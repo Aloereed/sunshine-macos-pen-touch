@@ -1,0 +1,375 @@
+diff --git a/src/input.cpp b/src/input.cpp
+index a12514d..9d766f7 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -2203,6 +2203,7 @@ namespace input {
+     reset_mouse_buttons();
+     reset_keyboard_keys();
+     reset_gamepads(input);
++    platf::virtualhid::reset_client_pointers(platf::virtualhid::get_client_context(input->client_context.get()));
+   }
+ 
+   /**
+diff --git a/src/platform/macos/display.mm b/src/platform/macos/display.mm
+index d5fe3d0..e2ec0b5 100644
+--- a/src/platform/macos/display.mm
++++ b/src/platform/macos/display.mm
+@@ -271,6 +271,17 @@ namespace platf {
+     display->env_width = display->width;
+     display->env_height = display->height;
+ 
++    // Native pen coordinates are injected in CoreGraphics screen points, not
++    // the capture's backing pixels. Publish both so input::monitor_touch_port
++    // can normalize Retina and scaled virtual displays correctly.
++    const auto input_bounds = CGDisplayBounds(display->display_id);
++    display->logical_width = static_cast<int>(input_bounds.size.width);
++    display->logical_height = static_cast<int>(input_bounds.size.height);
++    display->env_logical_width = display->logical_width;
++    display->env_logical_height = display->logical_height;
++    display->offset_x = static_cast<int>(input_bounds.origin.x);
++    display->offset_y = static_cast<int>(input_bounds.origin.y);
++
+     if (hwdevice_type == platf::mem_type_e::videotoolbox) {
+       const auto pixel_format {videotoolbox_pixel_format(config)};
+       [display->av_capture setFrameWidth:config.width frameHeight:config.height];
+diff --git a/src/platform/virtualhid_input.cpp b/src/platform/virtualhid_input.cpp
+index 362f50a..778aa5e 100644
+--- a/src/platform/virtualhid_input.cpp
++++ b/src/platform/virtualhid_input.cpp
+@@ -430,6 +430,66 @@ namespace platf::virtualhid {
+       }
+     }
+ 
++    /**
++     * @brief End an emulated finger drag without moving the last valid pointer.
++     * @param context Client that owns the fallback mouse.
++     */
++    void release_touch_mouse(client_context_t &context) {
++      if (context.touch_mouse_id && context.touch_mouse) {
++        log_failure("release emulated finger drag"sv, context.touch_mouse->button(lvh::MouseButton::left, false));
++      }
++      context.touch_mouse_id.reset();
++    }
++
++    /**
++     * @brief Translate one finger to mouse clicks and drags on the main display.
++     * @param context Per-client fallback state; additional contacts are ignored.
++     * @param touch Contact in normalized capture coordinates.
++     */
++    void touch_mouse_update(client_context_t &context, const touch_input_t &touch) {
++      if (!context.touch_mouse) {
++        return;
++      }
++      if (touch.eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
++        release_touch_mouse(context);
++        return;
++      }
++      if (touch.eventType == LI_TOUCH_EVENT_UP || touch.eventType == LI_TOUCH_EVENT_CANCEL || touch.eventType == LI_TOUCH_EVENT_HOVER_LEAVE) {
++        if (context.touch_mouse_id == touch.pointerId) {
++          release_touch_mouse(context);
++        }
++        return;
++      }
++      if (context.pen_contact || !std::isfinite(touch.x) || !std::isfinite(touch.y)) {
++        return;
++      }
++      if (touch.eventType != LI_TOUCH_EVENT_DOWN && touch.eventType != LI_TOUCH_EVENT_MOVE) {
++        return;
++      }
++      if (context.touch_mouse_id && context.touch_mouse_id != touch.pointerId) {
++        return;
++      }
++      // Never promote an already held second finger/palm after the first contact
++      // or the pen is released. Only a fresh DOWN can start a new mouse drag.
++      if (!context.touch_mouse_id && touch.eventType != LI_TOUCH_EVENT_DOWN) {
++        return;
++      }
++      const auto move = context.touch_mouse->move_absolute(
++        static_cast<std::int32_t>(std::lround(std::clamp(touch.x, 0.0F, 1.0F) * 65535.0F)),
++        static_cast<std::int32_t>(std::lround(std::clamp(touch.y, 0.0F, 1.0F) * 65535.0F)),
++        65535,
++        65535
++      );
++      log_failure("move emulated finger pointer"sv, move);
++      if (move.ok() && !context.touch_mouse_id) {
++        const auto press = context.touch_mouse->button(lvh::MouseButton::left, true);
++        log_failure("press emulated finger pointer"sv, press);
++        if (press.ok()) {
++          context.touch_mouse_id = touch.pointerId;
++        }
++      }
++    }
++
+     void cancel_all_touches(client_context_t &context) {
+       if (!context.touch) {
+         return;
+@@ -520,6 +580,22 @@ namespace platf::virtualhid {
+         log_failure("create libvirtualhid pen tablet"sv, created.status);
+       }
+     }
++#ifdef __APPLE__
++    // macOS has no touchscreen backend. Preserve native pen input, while
++    // providing ordinary desktop controls for the client's raw finger packets.
++    if (!touch && capabilities.supports_mouse) {
++      auto created = global->runtime->create_mouse();
++      if (created) {
++        touch_mouse = std::move(created.mouse);
++      } else {
++        log_failure("create macOS finger mouse fallback"sv, created.status);
++      }
++    }
++#endif
++  }
++
++  client_context_t::~client_context_t() {
++    release_touch_mouse(*this);
+   }
+ 
+   std::unique_ptr<lvh::Runtime> create_runtime(lvh::BackendKind backend) {
+@@ -850,6 +926,7 @@ namespace platf::virtualhid {
+ 
+   void touch_update(client_context_t &context, const touch_port_t &touch_port, const touch_input_t &touch) {
+     if (!context.touch) {
++      touch_mouse_update(context, touch);
+       return;
+     }
+ 
+@@ -897,6 +974,13 @@ namespace platf::virtualhid {
+       return;
+     }
+ 
++    if (context.touch_mouse && pen.eventType != LI_TOUCH_EVENT_BUTTON_ONLY) {
++      context.pen_contact = pen.eventType == LI_TOUCH_EVENT_DOWN || pen.eventType == LI_TOUCH_EVENT_MOVE;
++      if (context.pen_contact) {
++        release_touch_mouse(context);
++      }
++    }
++
+     const auto pen_buttons = static_cast<std::byte>(pen.penButtons);
+     const std::array button_states {
+       std::pair {lvh::PenButton::primary, (pen_buttons & static_cast<std::byte>(LI_PEN_BUTTON_PRIMARY)) != std::byte {}},
+@@ -917,6 +1001,12 @@ namespace platf::virtualhid {
+       }
+     }
+ 
++    // Button-only packets do not carry position, pressure or tool data. Keep
++    // the last pen contact intact after applying the barrel-button changes.
++    if (pen.eventType == LI_TOUCH_EVENT_BUTTON_ONLY) {
++      return;
++    }
++
+     if (pen.eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
+       for (const auto button : context.pressed_pen_buttons) {
+         log_failure("release libvirtualhid pen button"sv, context.pen->button(button, false));
+@@ -973,6 +1063,17 @@ namespace platf::virtualhid {
+     log_failure("submit libvirtualhid pen state"sv, context.pen->place_tool(state));
+   }
+ 
++  void reset_client_pointers(client_context_t &context) {
++    release_touch_mouse(context);
++    context.pen_contact = false;
++    touch_input_t touch {};
++    touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
++    touch_update(context, {}, touch);
++    pen_input_t pen {};
++    pen.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
++    pen_update(context, {}, pen);
++  }
++
+   bool configured_gamepad_supports_touchpad() {
+     if (config::input.gamepad == "auto"sv) {
+       return true;
+diff --git a/src/platform/virtualhid_input.h b/src/platform/virtualhid_input.h
+index d6302b2..d3651f5 100644
+--- a/src/platform/virtualhid_input.h
++++ b/src/platform/virtualhid_input.h
+@@ -63,13 +63,25 @@ namespace platf::virtualhid {
+      */
+     explicit client_context_t(input_context_t &input);
+ 
++    /** @brief Release any emulated finger drag before destroying this client. */
++    ~client_context_t();
++
+     input_context_t *global = nullptr;  ///< Shared global input context.
+     std::unique_ptr<lvh::Touchscreen> touch;  ///< Per-client touchscreen.
+     std::unique_ptr<lvh::PenTablet> pen;  ///< Per-client pen tablet.
++    std::unique_ptr<lvh::Mouse> touch_mouse;  ///< macOS single-finger mouse fallback when native touch is unavailable.
++    std::optional<std::uint32_t> touch_mouse_id;  ///< Contact currently owning the emulated left button.
++    bool pen_contact = false;  ///< Suppress new finger drags while the pen is drawing.
+     std::set<std::int32_t> active_touches;  ///< Active touchscreen contacts.
+     std::set<lvh::PenButton> pressed_pen_buttons;  ///< Active pen tablet buttons.
+   };
+ 
++  /**
++   * @brief Release retained touch and pen contacts when a stream disconnects.
++   * @param context Per-client devices whose identities survive reconnects.
++   */
++  void reset_client_pointers(client_context_t &context);
++
+   /**
+    * @brief Return the shared libvirtualhid context from a platform input backend.
+    *
+diff --git a/tests/unit/platform/test_virtualhid_input.cpp b/tests/unit/platform/test_virtualhid_input.cpp
+index 637b64b..a16664d 100644
+--- a/tests/unit/platform/test_virtualhid_input.cpp
++++ b/tests/unit/platform/test_virtualhid_input.cpp
+@@ -868,6 +868,159 @@ TEST_F(VirtualHidDeviceTest, TranslatesPenButtonsToolsAndTransitions) {
+   platf::virtualhid::pen_update(*client(), viewport, pen);
+ }
+ 
++TEST_F(VirtualHidDeviceTest, PenButtonOnlyDoesNotReplacePressureOrPosition) {
++  const platf::touch_port_t viewport {1, 2, 1000, 500, 1000, 500};
++  platf::pen_input_t pen {
++    LI_TOUCH_EVENT_DOWN,
++    LI_TOOL_TYPE_PEN,
++    0,
++    LI_TILT_UNKNOWN,
++    LI_ROT_UNKNOWN,
++    0.25F,
++    0.75F,
++    0.65F,
++    0.0F,
++    0.0F,
++  };
++  platf::virtualhid::pen_update(*client(), viewport, pen);
++  pen.eventType = LI_TOUCH_EVENT_BUTTON_ONLY;
++  pen.toolType = LI_TOOL_TYPE_UNKNOWN;
++  pen.penButtons = LI_PEN_BUTTON_PRIMARY;
++  pen.x = pen.y = pen.pressureOrDistance = 0;
++  platf::virtualhid::pen_update(*client(), viewport, pen);
++  const auto state = client()->pen->last_submitted_tool();
++  EXPECT_FLOAT_EQ(state.x, 0.25F);
++  EXPECT_FLOAT_EQ(state.y, 0.75F);
++  EXPECT_FLOAT_EQ(state.pressure, 0.65F);
++  EXPECT_EQ(state.tool, lvh::PenToolType::pen);
++  EXPECT_EQ(state.transition, lvh::PointerTransition::update);
++  EXPECT_TRUE(client()->pressed_pen_buttons.contains(lvh::PenButton::primary));
++}
++
++TEST_F(VirtualHidDeviceTest, DisconnectCancelsRetainedTouchAndPenWithoutClosingDevices) {
++  const platf::touch_port_t viewport {0, 0, 1440, 810, 1440, 810};
++  platf::touch_input_t touch {};
++  touch.eventType = LI_TOUCH_EVENT_DOWN;
++  touch.pointerId = 7;
++  touch.x = touch.y = 0.5F;
++  platf::virtualhid::touch_update(*client(), viewport, touch);
++  platf::pen_input_t pen {};
++  pen.eventType = LI_TOUCH_EVENT_DOWN;
++  pen.toolType = LI_TOOL_TYPE_PEN;
++  pen.penButtons = LI_PEN_BUTTON_PRIMARY;
++  pen.pressureOrDistance = 0.6F;
++  platf::virtualhid::pen_update(*client(), viewport, pen);
++  ASSERT_FALSE(client()->active_touches.empty());
++  ASSERT_FALSE(client()->pressed_pen_buttons.empty());
++
++  platf::virtualhid::reset_client_pointers(*client());
++  EXPECT_TRUE(client()->active_touches.empty());
++  EXPECT_TRUE(client()->pressed_pen_buttons.empty());
++  EXPECT_EQ(client()->pen->last_submitted_tool().transition, lvh::PointerTransition::cancel);
++  EXPECT_TRUE(client()->pen->is_open());
++  EXPECT_TRUE(client()->touch->is_open());
++
++  pen.penButtons = 0;
++  platf::virtualhid::pen_update(*client(), viewport, pen);
++  EXPECT_EQ(client()->pen->last_submitted_tool().transition, lvh::PointerTransition::update);
++  EXPECT_FLOAT_EQ(client()->pen->last_submitted_tool().pressure, 0.6F);
++}
++
++TEST_F(VirtualHidDeviceTest, FingerFallbackClicksDragsAndReleasesOnlyItsOwningContact) {
++  client()->touch.reset();
++  client()->touch_mouse = context()->runtime->create_mouse().mouse;
++  ASSERT_TRUE(client()->touch_mouse);
++  auto &mouse = *client()->touch_mouse;
++  platf::touch_input_t touch {};
++  touch.eventType = LI_TOUCH_EVENT_DOWN;
++  touch.pointerId = 10;
++  touch.x = 0.25F;
++  touch.y = 0.75F;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.submit_count(), 2);
++  EXPECT_TRUE(mouse.last_submitted_event().pressed);
++  EXPECT_EQ(client()->touch_mouse_id, 10U);
++
++  touch.pointerId = 11;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  touch.eventType = LI_TOUCH_EVENT_UP;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.submit_count(), 2);
++  EXPECT_EQ(client()->touch_mouse_id, 10U);
++
++  touch.pointerId = 10;
++  touch.eventType = LI_TOUCH_EVENT_MOVE;
++  touch.x = 0.5F;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.last_submitted_event().kind, lvh::MouseEventKind::absolute_motion);
++  EXPECT_EQ(mouse.last_submitted_event().x, 32768);
++  EXPECT_EQ(mouse.last_submitted_event().width, 65535);
++  touch.eventType = LI_TOUCH_EVENT_UP;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_FALSE(mouse.last_submitted_event().pressed);
++  EXPECT_FALSE(client()->touch_mouse_id);
++}
++
++TEST_F(VirtualHidDeviceTest, FingerFallbackRejectsInvalidStartButAlwaysCancelsAnActiveDrag) {
++  client()->touch.reset();
++  client()->touch_mouse = context()->runtime->create_mouse().mouse;
++  auto &mouse = *client()->touch_mouse;
++  platf::touch_input_t touch {};
++  touch.eventType = LI_TOUCH_EVENT_DOWN;
++  touch.x = std::numeric_limits<float>::quiet_NaN();
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.submit_count(), 0);
++  touch.x = 0.5F;
++  touch.eventType = LI_TOUCH_EVENT_MOVE;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.submit_count(), 0);
++  touch.eventType = LI_TOUCH_EVENT_DOWN;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  ASSERT_TRUE(client()->touch_mouse_id);
++  touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
++  touch.x = std::numeric_limits<float>::quiet_NaN();
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_FALSE(mouse.last_submitted_event().pressed);
++  EXPECT_FALSE(client()->touch_mouse_id);
++}
++
++TEST_F(VirtualHidDeviceTest, PenTakesPriorityOverFingerAndRequiresFreshFingerDownAfterRelease) {
++  client()->touch.reset();
++  client()->touch_mouse = context()->runtime->create_mouse().mouse;
++  auto &mouse = *client()->touch_mouse;
++  platf::touch_input_t touch {};
++  touch.eventType = LI_TOUCH_EVENT_DOWN;
++  touch.x = touch.y = 0.5F;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  ASSERT_TRUE(client()->touch_mouse_id);
++  platf::pen_input_t pen {};
++  pen.eventType = LI_TOUCH_EVENT_DOWN;
++  pen.toolType = LI_TOOL_TYPE_PEN;
++  pen.pressureOrDistance = 0.5F;
++  platf::virtualhid::pen_update(*client(), {}, pen);
++  EXPECT_TRUE(client()->pen_contact);
++  EXPECT_FALSE(client()->touch_mouse_id);
++  EXPECT_FALSE(mouse.last_submitted_event().pressed);
++  const auto count = mouse.submit_count();
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.submit_count(), count);
++  pen.eventType = LI_TOUCH_EVENT_BUTTON_ONLY;
++  platf::virtualhid::pen_update(*client(), {}, pen);
++  EXPECT_TRUE(client()->pen_contact);
++  pen.eventType = LI_TOUCH_EVENT_UP;
++  platf::virtualhid::pen_update(*client(), {}, pen);
++  EXPECT_FALSE(client()->pen_contact);
++  touch.eventType = LI_TOUCH_EVENT_MOVE;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_EQ(mouse.submit_count(), count);
++  touch.eventType = LI_TOUCH_EVENT_DOWN;
++  platf::virtualhid::touch_update(*client(), {}, touch);
++  EXPECT_TRUE(client()->touch_mouse_id);
++  platf::virtualhid::reset_client_pointers(*client());
++  EXPECT_FALSE(client()->touch_mouse_id);
++  EXPECT_FALSE(mouse.last_submitted_event().pressed);
++}
++
+ TEST_F(VirtualHidDeviceTest, PlatformWrappersForwardToVirtualHidContext) {
+   auto platform_input = platf::input();
+   ASSERT_TRUE(platform_input);

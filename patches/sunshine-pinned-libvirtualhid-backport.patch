@@ -1,0 +1,341 @@
+diff --git a/src/platform/macos/macos_backend.cpp b/src/platform/macos/macos_backend.cpp
+index c67ca89..f93efde 100644
+--- a/src/platform/macos/macos_backend.cpp
++++ b/src/platform/macos/macos_backend.cpp
+@@ -6,6 +6,7 @@
+ // standard includes
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
+@@ -771,6 +772,293 @@ namespace lvh::detail {
+       bool open_ = true;
+     };
+ 
++    /**
++     * @brief Resolve a portable pointer viewport to CoreGraphics desktop bounds.
++     *
++     * @param viewport Consumer-selected viewport in CoreGraphics screen points, or zero dimensions for the main display.
++     * @return Current CoreGraphics bounds used for mouse mapping and confinement.
++     */
++    inline CGRect mouse_viewport_bounds(const PointerViewport &viewport) {
++      if (viewport.width > 0 && viewport.height > 0) {
++        return CGRect {
++          .origin = CGPoint {
++            static_cast<CGFloat>(viewport.offset_x),
++            static_cast<CGFloat>(viewport.offset_y),
++          },
++          .size = CGSize {
++            static_cast<CGFloat>(viewport.width),
++            static_cast<CGFloat>(viewport.height),
++          },
++        };
++      }
++
++      return CGDisplayBounds(CGMainDisplayID());
++    }
++
++    /**
++     * @brief CoreGraphics pen device with per-client proximity and contact state.
++     *
++     * This is event injection, not a registered HID device. Applications need
++     * proximity before point events to associate pressure with the pen. The
++     * consuming process requires macOS synthetic-input permission.
++     */
++    class MacosPenTablet final: public BackendPenTablet {
++    public:
++      /**
++       * @brief Create an independent pen event stream.
++       * @param state Shared modifier and CoreGraphics source state.
++       * @param id Runtime device identity used to correlate proximity and points.
++       */
++      MacosPenTablet(std::shared_ptr<MacosInputState> state, DeviceId id):
++          state_ {std::move(state)},
++          id_ {id} {}
++
++      ~MacosPenTablet() override {
++        static_cast<void>(close());
++      }
++
++      OperationStatus place_tool(const PenToolState &input) override {
++        std::lock_guard lock {mutex_};
++        if (!open_) {
++          return OperationStatus::failure(ErrorCode::device_closed, "macOS pen tablet is closed");
++        }
++        // Cancellation must release the last valid point even if its packet has
++        // no usable position. Never move to (0, 0) while releasing a stuck tip.
++        if (input.transition == PointerTransition::cancel || input.transition == PointerTransition::leave) {
++          return leave();
++        }
++        if (!std::isfinite(input.x) || !std::isfinite(input.y) || !std::isfinite(input.pressure) || !std::isfinite(input.distance) || !std::isfinite(input.tilt_x) || !std::isfinite(input.tilt_y)) {
++          return OperationStatus::failure(ErrorCode::invalid_argument, "macOS pen state must be finite");
++        }
++        if (input.tool == PenToolType::touch) {
++          return OperationStatus::failure(ErrorCode::unsupported_profile, "macOS pen backend does not inject finger touch");
++        }
++        const auto next_tool = input.tool == PenToolType::unchanged ? tool_ : input.tool;
++        if (in_range_ && next_tool != tool_) {
++          const auto held_buttons = barrel_;
++          const auto status = leave();
++          if (!status.ok()) {
++            return status;
++          }
++          barrel_ = held_buttons;
++        }
++        const auto bounds = mouse_viewport_bounds(input.viewport);
++        if (bounds.size.width < 1 || bounds.size.height < 1) {
++          return OperationStatus::failure(ErrorCode::backend_failure, "macOS pen viewport is unavailable");
++        }
++        location_ = {
++          bounds.origin.x + std::clamp(input.x, 0.0F, 1.0F) * std::max(0.0, bounds.size.width - 1.0),
++          bounds.origin.y + std::clamp(input.y, 0.0F, 1.0F) * std::max(0.0, bounds.size.height - 1.0),
++        };
++        tablet_x_ = static_cast<int64_t>(std::clamp(input.x, 0.0F, 1.0F) * 65535.0F);
++        tablet_y_ = static_cast<int64_t>(std::clamp(input.y, 0.0F, 1.0F) * 65535.0F);
++        tool_ = next_tool;
++        // AppKit tablet consumers (including Qt) interpret full-scale tilt as
++        // 60 degrees, and invert the vertical tablet axis relative to screen Y.
++        tilt_x_ = std::clamp(input.tilt_x / 60.0F, -1.0F, 1.0F);
++        tilt_y_ = std::clamp(-input.tilt_y / 60.0F, -1.0F, 1.0F);
++        if (input.transition == PointerTransition::release && !in_range_) {
++          return OperationStatus::success();
++        }
++        if (!in_range_) {
++          const auto status = proximity(true);
++          if (!status.ok()) {
++            return status;
++          }
++          in_range_ = true;
++          for (unsigned i = 0; i < barrel_.size(); ++i) {
++            if (barrel_[i]) {
++              const auto button_status = point(i == 0 ? kCGEventRightMouseDown : kCGEventOtherMouseDown, false, i == 0 ? kCGMouseButtonRight : kCGMouseButtonCenter);
++              if (!button_status.ok()) {
++                return button_status;
++              }
++              delivered_barrel_[i] = true;
++            }
++          }
++        }
++        const bool next_contact = input.transition == PointerTransition::update &&
++                                  (input.pressure >= 0.0F || (contact_ && input.distance < 0.0F));
++        pressure_ = next_contact ? (input.pressure < 0.0F ? pressure_ : std::clamp(input.pressure, 0.0F, 1.0F)) : 0.0F;
++        const auto type = next_contact != contact_ ? (next_contact ? kCGEventLeftMouseDown : kCGEventLeftMouseUp) :
++                                                     (next_contact ? kCGEventTabletPointer : kCGEventMouseMoved);
++        const auto status = point(type, next_contact, kCGMouseButtonLeft);
++        if (status.ok()) {
++          contact_ = next_contact;
++        }
++        return status;
++      }
++
++      OperationStatus button(PenButton button, bool pressed) override {
++        std::lock_guard lock {mutex_};
++        if (!open_) {
++          return OperationStatus::failure(ErrorCode::device_closed, "macOS pen tablet is closed");
++        }
++        // CoreGraphics exposes right and middle mouse transitions. Do not
++        // silently map a third barrel button onto a different physical button.
++        if (button != PenButton::primary && button != PenButton::secondary) {
++          return OperationStatus::failure(ErrorCode::unsupported_profile, "macOS pen supports two barrel buttons");
++        }
++        const auto index = button == PenButton::primary ? 0U : 1U;
++        if (barrel_[index] == pressed) {
++          return OperationStatus::success();
++        }
++        barrel_[index] = pressed;
++        if (!in_range_) {
++          return OperationStatus::success();
++        }
++        const auto type = index == 0 ? (pressed ? kCGEventRightMouseDown : kCGEventRightMouseUp) :
++                                       (pressed ? kCGEventOtherMouseDown : kCGEventOtherMouseUp);
++        const auto status = point(type, contact_, index == 0 ? kCGMouseButtonRight : kCGMouseButtonCenter);
++        if (status.ok()) {
++          delivered_barrel_[index] = pressed;
++        } else {
++          barrel_[index] = !pressed;
++        }
++        return status;
++      }
++
++      OperationStatus close() override {
++        std::lock_guard lock {mutex_};
++        if (!open_) {
++          return OperationStatus::success();
++        }
++        const auto status = leave();
++        if (status.ok()) {
++          open_ = false;
++        }
++        return status;
++      }
++
++    private:
++      /**
++       * @brief Allocate an event preserving shared keyboard modifiers.
++       * @param type Native event type.
++       * @return Owned CoreGraphics event, or null on allocation failure.
++       */
++      CGEventRef event(CGEventType type) const {
++        const auto result = CGEventCreate(state_->source);
++        if (result) {
++          CGEventSetType(result, type);
++          CGEventSetLocation(result, location_);
++          CGEventSetTimestamp(result, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++          std::lock_guard lock {state_->keyboard_mutex};
++          CGEventSetFlags(result, state_->keyboard_flags);
++        }
++        return result;
++      }
++
++      /**
++       * @brief Announce or retire the device before delivering tablet points.
++       * @param entering Whether the pen is entering range.
++       * @return Allocation/delivery status.
++       */
++      OperationStatus proximity(bool entering) {
++        const auto e = event(kCGEventTabletProximity);
++        if (!e) {
++          return OperationStatus::failure(ErrorCode::backend_failure, "cannot create macOS pen proximity event");
++        }
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventDeviceID, id_);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventPointerID, id_);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventSystemTabletID, id_);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventTabletID, id_);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventVendorUniqueID, id_);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventVendorPointerSerialNumber, id_);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventPointerType, tool_ == PenToolType::eraser ? 3 : 1);
++        // X, Y, buttons, pressure, tilt X/Y and device ID, without claiming
++        // tangential pressure, rotation or vendor-specific features.
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventCapabilityMask, 0x7f);
++        CGEventSetIntegerValueField(e, kCGTabletProximityEventEnterProximity, entering);
++        CGEventPost(kCGHIDEventTap, e);
++        CFRelease(e);
++        return OperationStatus::success();
++      }
++
++      /**
++       * @brief Post a tablet point or a mouse transition carrying tablet data.
++       * @param type CoreGraphics pointer event type.
++       * @param contact Whether the tip is touching.
++       * @param button Mouse button associated with a transition.
++       * @return Allocation/delivery status.
++       */
++      OperationStatus point(CGEventType type, bool contact, CGMouseButton button) {
++        const auto e = event(type);
++        if (!e) {
++          return OperationStatus::failure(ErrorCode::backend_failure, "cannot create macOS pen point event");
++        }
++        CGEventSetIntegerValueField(e, kCGMouseEventSubtype, kCGEventMouseSubtypeTabletPoint);
++        CGEventSetIntegerValueField(e, kCGMouseEventButtonNumber, button);
++        CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1);
++        CGEventSetIntegerValueField(e, kCGTabletEventDeviceID, id_);
++        CGEventSetIntegerValueField(e, kCGTabletEventPointButtons, (contact ? 1 : 0) | (barrel_[0] ? 2 : 0) | (barrel_[1] ? 4 : 0));
++        CGEventSetDoubleValueField(e, kCGMouseEventPressure, contact ? pressure_ : 0.0);
++        CGEventSetDoubleValueField(e, kCGTabletEventPointPressure, contact ? pressure_ : 0.0);
++        CGEventSetDoubleValueField(e, kCGTabletEventTiltX, tilt_x_);
++        CGEventSetDoubleValueField(e, kCGTabletEventTiltY, tilt_y_);
++        CGEventSetIntegerValueField(e, kCGTabletEventPointX, tablet_x_);
++        CGEventSetIntegerValueField(e, kCGTabletEventPointY, tablet_y_);
++        // Tablet-point events retain 16-bit pressure, whereas mouse subtype
++        // events lose precision in AppKit. They do not move the cursor themselves.
++        if (type == kCGEventTabletPointer) {
++          CGWarpMouseCursorPosition(location_);
++        }
++        CGEventPost(kCGHIDEventTap, e);
++        CFRelease(e);
++        return OperationStatus::success();
++      }
++
++      /**
++       * @brief Release contact and barrel buttons before retiring proximity.
++       * @return First delivery failure, or success for an already inactive pen.
++       */
++      OperationStatus leave() {
++        if (!in_range_) {
++          barrel_ = {};
++          return OperationStatus::success();
++        }
++        pressure_ = 0.0F;
++        if (contact_) {
++          const auto status = point(kCGEventLeftMouseUp, false, kCGMouseButtonLeft);
++          if (!status.ok()) {
++            return status;
++          }
++          contact_ = false;
++        }
++        for (unsigned i = 0; i < barrel_.size(); ++i) {
++          if (delivered_barrel_[i]) {
++            barrel_[i] = false;
++            const auto status = point(i == 0 ? kCGEventRightMouseUp : kCGEventOtherMouseUp, false, i == 0 ? kCGMouseButtonRight : kCGMouseButtonCenter);
++            if (!status.ok()) {
++              barrel_[i] = true;
++              return status;
++            }
++            delivered_barrel_[i] = false;
++          }
++        }
++        barrel_ = {};
++        const auto status = proximity(false);
++        if (status.ok()) {
++          in_range_ = false;
++        }
++        return status;
++      }
++
++      std::shared_ptr<MacosInputState> state_;  ///< Shared native event source and modifier flags.
++      DeviceId id_;  ///< Runtime identity shared by proximity and point events.
++      CGPoint location_ {};  ///< Last valid desktop position in screen points.
++      int64_t tablet_x_ = 0;  ///< Non-negative tablet-space horizontal coordinate.
++      int64_t tablet_y_ = 0;  ///< Non-negative tablet-space vertical coordinate.
++      PenToolType tool_ = PenToolType::pen;  ///< Active tool, preserved for unchanged updates.
++      float pressure_ = 0;  ///< Last normalized tip pressure.
++      float tilt_x_ = 0;  ///< Normalized CoreGraphics horizontal tilt.
++      float tilt_y_ = 0;  ///< Normalized CoreGraphics vertical tilt.
++      std::array<bool, 2> barrel_ {};  ///< Primary and secondary barrel-button states.
++      std::array<bool, 2> delivered_barrel_ {};  ///< Barrel downs actually delivered while in range.
++      bool contact_ = false;  ///< Whether a tip-down transition has been posted.
++      bool in_range_ = false;  ///< Whether enter-proximity has been posted.
++      bool open_ = true;  ///< Reject submissions once explicitly closed.
++      std::mutex mutex_;  ///< Serialize per-device transitions and teardown.
++    };
++
+     /**
+      * @brief macOS platform backend.
+      */
+@@ -780,6 +1068,7 @@ namespace lvh::detail {
+         capabilities_.backend_name = "macos-coregraphics";
+         capabilities_.supports_keyboard = true;
+         capabilities_.supports_mouse = true;
++        capabilities_.supports_pen_tablet = true;
+       }
+ 
+       const BackendCapabilities &capabilities() const override {
+@@ -825,9 +1114,24 @@ namespace lvh::detail {
+ 
+       BackendPenTabletCreationResult create_pen_tablet(
+         DeviceId /*id*/,
+-        const CreatePenTabletOptions & /*options*/
++        const CreatePenTabletOptions &options
+       ) override {
+-        return {OperationStatus::failure(ErrorCode::unsupported_profile, "macOS pen tablet backend is not implemented"), nullptr};
++        if (options.profile.device_type != DeviceType::pen_tablet) {
++          return {OperationStatus::failure(ErrorCode::unsupported_profile, "device profile is not a pen tablet"), nullptr};
++        }
++        auto state = state_;
++        if (!state->source) {
++          return {OperationStatus::failure(ErrorCode::backend_failure, "macOS pen event source is unavailable"), nullptr};
++        }
++        // Runtime IDs can overlap across independent Runtime instances. Allocate
++        // a process-wide 16-bit tablet event identity, avoiding common hardware
++        // IDs and never silently wrapping onto an active synthetic device.
++        static std::atomic<std::uint32_t> next_tablet_id {0x8000};
++        const auto tablet_id = next_tablet_id.fetch_add(1, std::memory_order_relaxed);
++        if (tablet_id > 0xffff) {
++          return {OperationStatus::failure(ErrorCode::backend_unavailable, "macOS synthetic pen identities exhausted"), nullptr};
++        }
++        return {OperationStatus::success(), std::make_unique<MacosPenTablet>(std::move(state), tablet_id)};
+       }
+ 
+     private:

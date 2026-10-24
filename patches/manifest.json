@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-24",
+  "patches": [
+    {
+      "file": "patches/libvirtualhid-macos-pen.patch",
+      "base_commit": "45c9b4db05779d18224a751e33cb8dfea78201bb",
+      "bytes": 35143,
+      "sha256": "cc8c5a4f0a4a92ff695818f3c4934b57d927b52a4df73816e2d7782325e42eab",
+      "base_apply_check": "passed",
+      "use": "developer",
+      "checkout": "separate-libvirtualhid-checkout"
+    },
+    {
+      "file": "patches/sunshine-pen-integration.patch",
+      "base_commit": "63d35f702ee9e362e43263742981836ec0710384",
+      "bytes": 15608,
+      "sha256": "86c51ab4f8bbaa11201e11bd1f3959634047e1009c067a88da3984a83feb6703",
+      "base_apply_check": "passed",
+      "use": "runtime",
+      "checkout": "."
+    },
+    {
+      "file": "patches/sunshine-pinned-libvirtualhid-backport.patch",
+      "base_commit": "53e1a949fc0784af716b782ddfa6c647cafd1f05",
+      "bytes": 16236,
+      "sha256": "f5e6d2e0d047ce643a4dd5a744a87e9c5306d3d9b63ec09622b4fb5fd1ef6e82",
+      "base_apply_check": "passed",
+      "use": "runtime",
+      "checkout": "third-party/libvirtualhid"
+    }
+  ]
+}
